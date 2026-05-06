@@ -430,6 +430,26 @@ function currentResults(results: ExperimentResult[], segment: number): Experimen
 interface AutoresearchConfig {
   maxIterations?: number;
   workingDir?: string;
+  artifactRoot?: string;
+}
+
+export interface AutoresearchScope {
+  workingDir?: string;
+  artifactRoot?: string;
+}
+
+const AUTORESEARCH_SCOPE_KEY = Symbol.for("pi-autoresearch.scope");
+
+export function setAutoresearchScope(ctx: ExtensionContext, scope: AutoresearchScope): void {
+  (ctx as unknown as { [AUTORESEARCH_SCOPE_KEY]?: AutoresearchScope })[AUTORESEARCH_SCOPE_KEY] = scope;
+}
+
+export function clearAutoresearchScope(ctx: ExtensionContext): void {
+  delete (ctx as unknown as { [AUTORESEARCH_SCOPE_KEY]?: AutoresearchScope })[AUTORESEARCH_SCOPE_KEY];
+}
+
+function getAutoresearchScope(ctx: ExtensionContext): AutoresearchScope {
+  return (ctx as unknown as { [AUTORESEARCH_SCOPE_KEY]?: AutoresearchScope })[AUTORESEARCH_SCOPE_KEY] ?? {};
 }
 
 /** Read autoresearch.config.json from the given directory (always ctx.cwd) */
@@ -456,12 +476,21 @@ function readMaxExperiments(cwd: string): number | null {
  * Reads workingDir from autoresearch.config.json in ctxCwd.
  * Returns ctxCwd if not set. Supports relative (resolved against ctxCwd) and absolute paths.
  */
-function resolveWorkDir(ctxCwd: string): string {
+export function resolveConfiguredDir(ctxCwd: string, configuredPath: string | undefined, fallback: string): string {
+  if (!configuredPath) return fallback;
+  return path.isAbsolute(configuredPath)
+    ? configuredPath
+    : path.resolve(ctxCwd, configuredPath);
+}
+
+export function resolveWorkDir(ctxCwd: string): string {
   const config = readConfig(ctxCwd);
-  if (!config.workingDir) return ctxCwd;
-  return path.isAbsolute(config.workingDir)
-    ? config.workingDir
-    : path.resolve(ctxCwd, config.workingDir);
+  return resolveConfiguredDir(ctxCwd, config.workingDir, ctxCwd);
+}
+
+export function resolveArtifactRoot(ctxCwd: string): string {
+  const config = readConfig(ctxCwd);
+  return resolveConfiguredDir(ctxCwd, config.artifactRoot, resolveWorkDir(ctxCwd));
 }
 
 /**
@@ -470,7 +499,6 @@ function resolveWorkDir(ctxCwd: string): string {
  */
 function validateWorkDir(ctxCwd: string): string | null {
   const workDir = resolveWorkDir(ctxCwd);
-  if (workDir === ctxCwd) return null;
   try {
     const stat = fs.statSync(workDir);
     if (!stat.isDirectory()) {
@@ -480,6 +508,59 @@ function validateWorkDir(ctxCwd: string): string | null {
     return `workingDir "${workDir}" (from autoresearch.config.json) does not exist.`;
   }
   return null;
+}
+
+function validateArtifactRoot(ctxCwd: string): string | null {
+  const artifactRoot = resolveArtifactRoot(ctxCwd);
+  try {
+    const stat = fs.statSync(artifactRoot);
+    if (!stat.isDirectory()) {
+      return `artifactRoot "${artifactRoot}" (from autoresearch.config.json) is not a directory.`;
+    }
+  } catch {
+    return `artifactRoot "${artifactRoot}" (from autoresearch.config.json) does not exist.`;
+  }
+  return null;
+}
+
+function validateRuntimeDirs(ctxCwd: string): string | null {
+  return validateWorkDir(ctxCwd) ?? validateArtifactRoot(ctxCwd);
+}
+
+function resolveWorkDirForContext(ctx: ExtensionContext): string {
+  const scope = getAutoresearchScope(ctx);
+  return resolveConfiguredDir(ctx.cwd, scope.workingDir, resolveWorkDir(ctx.cwd));
+}
+
+function resolveArtifactRootForContext(ctx: ExtensionContext): string {
+  const scope = getAutoresearchScope(ctx);
+  const config = readConfig(ctx.cwd);
+  const workDir = resolveWorkDirForContext(ctx);
+  return resolveConfiguredDir(ctx.cwd, scope.artifactRoot ?? config.artifactRoot, workDir);
+}
+
+function validateRuntimeDirsForContext(ctx: ExtensionContext): string | null {
+  const workDir = resolveWorkDirForContext(ctx);
+  const artifactRoot = resolveArtifactRootForContext(ctx);
+  for (const [name, dir] of [["workingDir", workDir], ["artifactRoot", artifactRoot]] as const) {
+    try {
+      const stat = fs.statSync(dir);
+      if (!stat.isDirectory()) return `${name} "${dir}" is not a directory.`;
+    } catch {
+      return `${name} "${dir}" does not exist.`;
+    }
+  }
+  return null;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function commandForExecution(command: string, artifactRoot: string, workDir: string): string {
+  if (artifactRoot === workDir) return command;
+  if (!isAutoresearchShCommand(command)) return command;
+  return `bash ${shellQuote(autoresearchScriptPath(artifactRoot))}`;
 }
 
 /** Baseline = first experiment in current segment */
@@ -1093,7 +1174,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return {
       compaction: {
         summary: buildAutoresearchCompactionSummary(
-          autoresearchSummaryPathsFor(resolveWorkDir(ctx.cwd)),
+          autoresearchSummaryPathsFor(resolveArtifactRootForContext(ctx)),
         ),
         firstKeptEntryId: event.preparation.firstKeptEntryId,
         tokensBefore: event.preparation.tokensBefore,
@@ -1110,10 +1191,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const hasAutoresearchRules = (ctx: ExtensionContext): boolean =>
-    fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)));
+    fs.existsSync(autoresearchMdPath(resolveArtifactRootForContext(ctx)));
 
-  const readJsonlLines = (workDir: string): string[] => {
-    const jsonlPath = autoresearchJsonlPath(workDir);
+  const readJsonlLines = (artifactRoot: string): string[] => {
+    const jsonlPath = autoresearchJsonlPath(artifactRoot);
     if (!fs.existsSync(jsonlPath)) return [];
     return fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
   };
@@ -1196,11 +1277,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     let state = runtime.state;
 
-    // Resolve effective working directory (config stays in ctx.cwd, files in workDir)
-    const workDir = resolveWorkDir(ctx.cwd);
+    // Resolve effective artifact root (config stays in ctx.cwd, files in artifactRoot)
+    const artifactRoot = resolveArtifactRootForContext(ctx);
 
     // Primary: read from autoresearch.jsonl (alongside autoresearch.md/sh)
-    const jsonlPath = autoresearchJsonlPath(workDir);
+    const jsonlPath = autoresearchJsonlPath(artifactRoot);
     let loadedFromJsonl = false;
     try {
       if (fs.existsSync(jsonlPath)) {
@@ -1257,7 +1338,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(autoresearchJsonlPath(workDir));
+    runtime.autoresearchMode = fs.existsSync(autoresearchJsonlPath(artifactRoot));
 
     updateWidget(ctx);
   };
@@ -1482,12 +1563,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     if (!runtime.autoresearchMode) return;
 
-    const workDir = resolveWorkDir(ctx.cwd);
-    const mdPath = autoresearchMdPath(workDir);
-    const ideasPath = autoresearchIdeasPath(workDir);
+    const artifactRoot = resolveArtifactRootForContext(ctx);
+    const mdPath = autoresearchMdPath(artifactRoot);
+    const ideasPath = autoresearchIdeasPath(artifactRoot);
     const hasIdeas = fs.existsSync(ideasPath);
 
-    const checksPath = autoresearchChecksPath(workDir);
+    const checksPath = autoresearchChecksPath(artifactRoot);
     const hasChecks = fs.existsSync(checksPath);
 
     let extra =
@@ -1540,11 +1621,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
-      // Validate working directory exists
-      const workDirError = validateWorkDir(ctx.cwd);
-      if (workDirError) {
+      const runtimeDirError = validateRuntimeDirsForContext(ctx);
+      if (runtimeDirError) {
         return {
-          content: [{ type: "text", text: `❌ ${workDirError}` }],
+          content: [{ type: "text", text: `❌ ${runtimeDirError}` }],
           details: {},
         };
       }
@@ -1570,9 +1650,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.maxExperiments = readMaxExperiments(ctx.cwd);
 
       // Write config header to jsonl (append for re-init, create for first)
-      const workDir = resolveWorkDir(ctx.cwd);
+      const workDir = resolveWorkDirForContext(ctx);
+      const artifactRoot = resolveArtifactRootForContext(ctx);
       try {
-        const jsonlPath = autoresearchJsonlPath(workDir);
+        const jsonlPath = autoresearchJsonlPath(artifactRoot);
         const config = JSON.stringify({
           type: "config",
           name: state.name,
@@ -1585,7 +1666,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else {
           fs.writeFileSync(jsonlPath, config + "\n");
         }
-        broadcastDashboardUpdate(workDir);
+        broadcastDashboardUpdate(artifactRoot);
       } catch (e) {
         return {
           content: [{
@@ -1603,9 +1684,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (wasInactive) {
         const steer = await fireHook({
           event: "before",
-          cwd: workDir,
+          cwd: artifactRoot,
           next_run: state.results.length + 1,
-          last_run: readLastRun(workDir),
+          last_run: readLastRun(artifactRoot),
           session: buildSessionSnapshot(state),
         });
         if (steer) pi.sendUserMessage(steer, { deliverAs: "steer" });
@@ -1614,10 +1695,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
       const workDirNote = workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
+      const artifactRootNote = artifactRoot !== workDir ? `\nArtifact root: ${artifactRoot}` : "";
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
+          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}${artifactRootNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
         }],
         details: { state: cloneExperimentState(state) },
       };
@@ -1658,15 +1740,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
-      // Validate working directory exists
-      const workDirError = validateWorkDir(ctx.cwd);
-      if (workDirError) {
+      const runtimeDirError = validateRuntimeDirsForContext(ctx);
+      if (runtimeDirError) {
         return {
-          content: [{ type: "text", text: `❌ ${workDirError}` }],
+          content: [{ type: "text", text: `❌ ${runtimeDirError}` }],
           details: {},
         };
       }
-      const workDir = resolveWorkDir(ctx.cwd);
+      const workDir = resolveWorkDirForContext(ctx);
+      const artifactRoot = resolveArtifactRootForContext(ctx);
 
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
@@ -1682,7 +1764,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
       // Guard: if autoresearch.sh exists, only allow running it
-      const autoresearchShPath = autoresearchScriptPath(workDir);
+      const autoresearchShPath = autoresearchScriptPath(artifactRoot);
       if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
         return {
           content: [{
@@ -1723,7 +1805,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }>((resolve, reject) => {
         let processTimedOut = false;
 
-        const child = spawn("bash", ["-c", params.command], {
+        const command = commandForExecution(params.command, artifactRoot, workDir);
+        const child = spawn("bash", ["-c", command], {
           cwd: workDir,
           detached: true,
           stdio: ["ignore", "pipe", "pipe"],
@@ -1886,7 +1969,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let checksOutput = "";
       let checksDuration = 0;
 
-      const checksPath = autoresearchChecksPath(workDir);
+      const checksPath = autoresearchChecksPath(artifactRoot);
       if (benchmarkPassed && fs.existsSync(checksPath)) {
         const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
@@ -2175,15 +2258,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
-      // Validate working directory exists
-      const workDirError = validateWorkDir(ctx.cwd);
-      if (workDirError) {
+      const runtimeDirError = validateRuntimeDirsForContext(ctx);
+      if (runtimeDirError) {
         return {
-          content: [{ type: "text", text: `❌ ${workDirError}` }],
+          content: [{ type: "text", text: `❌ ${runtimeDirError}` }],
           details: {},
         };
       }
-      const workDir = resolveWorkDir(ctx.cwd);
+      const workDir = resolveWorkDirForContext(ctx);
+      const artifactRoot = resolveArtifactRootForContext(ctx);
       const secondaryMetrics = params.metrics ?? {};
 
       // Gate: prevent "keep" when last run's checks failed
@@ -2385,8 +2468,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const jsonlLine = JSON.stringify(jsonlEntry);
 
       try {
-        fs.appendFileSync(autoresearchJsonlPath(workDir), jsonlLine + "\n");
-        broadcastDashboardUpdate(workDir);
+        fs.appendFileSync(autoresearchJsonlPath(artifactRoot), jsonlLine + "\n");
+        broadcastDashboardUpdate(artifactRoot);
       } catch (e) {
         text += `\n⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
@@ -2406,7 +2489,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const afterSteer = await fireHook({
         event: "after",
-        cwd: workDir,
+        cwd: artifactRoot,
         run_entry: jsonlEntry,
         session: buildSessionSnapshot(state),
       });
@@ -2425,7 +2508,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       } else if (runtime.autoresearchMode) {
         const beforeSteer = await fireHook({
           event: "before",
-          cwd: workDir,
+          cwd: artifactRoot,
           next_run: state.results.length + 1,
           last_run: jsonlEntry,
           session: buildSessionSnapshot(state),
@@ -2534,7 +2617,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
       if (state.results.length === 0) {
-        if (!runtime.autoresearchMode && !fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)))) {
+        if (!runtime.autoresearchMode && !fs.existsSync(autoresearchMdPath(resolveArtifactRootForContext(ctx)))) {
           ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
         } else {
           ctx.ui.notify("No experiments yet", "info");
@@ -2889,8 +2972,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   async function exportDashboard(ctx: ExtensionContext): Promise<void> {
-    const workDir = resolveWorkDir(ctx.cwd);
-    const jsonlPath = autoresearchJsonlPath(workDir);
+    const workDir = resolveWorkDirForContext(ctx);
+    const artifactRoot = resolveArtifactRootForContext(ctx);
+    const jsonlPath = autoresearchJsonlPath(artifactRoot);
 
     if (!fs.existsSync(jsonlPath)) {
       ctx.ui.notify("No autoresearch.jsonl found \u2014 run some experiments first", "error");
@@ -2898,8 +2982,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
 
     try {
-      const dashboardHtmlPath = writeDashboardFile(workDir);
-      const port = await startStaticServer(workDir, dashboardHtmlPath);
+      const dashboardHtmlPath = writeDashboardFile(artifactRoot);
+      const port = await startStaticServer(artifactRoot, dashboardHtmlPath);
       const url = `http://127.0.0.1:${port}`;
       openInBrowser(url);
       ctx.ui.notify(`Dashboard at ${url} (live updates)`, "info");
@@ -2954,7 +3038,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "clear") {
-        const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
+        const jsonlPath = autoresearchJsonlPath(resolveArtifactRootForContext(ctx));
         runtime.autoresearchMode = false;
         runtime.dashboardExpanded = false;
         runtime.autoResumeTurns = 0;
@@ -2990,7 +3074,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.autoresearchMode = true;
       runtime.autoResumeTurns = 0;
 
-      const workDir = resolveWorkDir(ctx.cwd);
+      const workDir = resolveWorkDirForContext(ctx);
+      const artifactRoot = resolveArtifactRootForContext(ctx);
       const rulesLoaded = hasAutoresearchRules(ctx);
       const kickoff = rulesLoaded
         ? `Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
@@ -3006,9 +3091,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const state = runtime.state;
       const activationSteer = await fireHook({
         event: "before",
-        cwd: workDir,
+        cwd: artifactRoot,
         next_run: state.results.length + 1,
-        last_run: readLastRun(workDir),
+        last_run: readLastRun(artifactRoot),
         session: buildSessionSnapshot(state),
       });
 
