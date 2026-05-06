@@ -560,7 +560,31 @@ function shellQuote(value: string): string {
 export function commandForExecution(command: string, artifactRoot: string, workDir: string): string {
   if (artifactRoot === workDir) return command;
   if (!isAutoresearchShCommand(command)) return command;
-  return `bash ${shellQuote(autoresearchScriptPath(artifactRoot))}`;
+
+  let offset = command.search(/\S/);
+  if (offset < 0) return command;
+  let cmd = command.slice(offset);
+
+  const envPrefix = cmd.match(/^(?:\w+=\S*\s+)+/);
+  if (envPrefix) {
+    offset += envPrefix[0].length;
+    cmd = command.slice(offset);
+  }
+
+  let wrapperMatch: RegExpMatchArray | null;
+  do {
+    wrapperMatch = cmd.match(/^(?:env|time|nice|nohup)(?:\s+-\S+(?:\s+\d+)?)*\s+/);
+    if (wrapperMatch) {
+      offset += wrapperMatch[0].length;
+      cmd = command.slice(offset);
+    }
+  } while (wrapperMatch);
+
+  const coreMatch = cmd.match(/^((?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?)((?:\.\/|\/[\w/.-]*\/)?autoresearch\.sh)(?=\s|$)/);
+  if (!coreMatch) return command;
+  const scriptStart = offset + coreMatch[1].length;
+  const scriptEnd = scriptStart + coreMatch[2].length;
+  return `${command.slice(0, scriptStart)}${shellQuote(autoresearchScriptPath(artifactRoot))}${command.slice(scriptEnd)}`;
 }
 
 /** Baseline = first experiment in current segment */

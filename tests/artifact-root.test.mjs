@@ -60,6 +60,10 @@ test("autoresearch.sh commands execute the artifactRoot script from workingDir",
     "bash '/tmp/kapi-artifacts/autoresearch.sh'",
   );
   assert.equal(
+    commandForExecution("FOO=1 time bash -e ./autoresearch.sh --smoke", artifactRoot, workDir),
+    "FOO=1 time bash -e '/tmp/kapi-artifacts/autoresearch.sh' --smoke",
+  );
+  assert.equal(
     commandForExecution("npm test", artifactRoot, workDir),
     "npm test",
   );
